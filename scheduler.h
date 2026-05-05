@@ -55,7 +55,8 @@ typedef struct TaskNode {
     pid_t cpid;             /* PID of the forked child                        */
     int   pipe_read_fd;     /* read end of the pipe from child's stdout       */
     bool  launched;         /* true after the first fork()                    */
-    int   n_scheduled;      /* how many times this task has been dispatched   */
+    int    n_scheduled;     /* how many times this task has been dispatched   */
+    size_t bytes_sent;      /* total payload bytes forwarded to the client    */
 
     TaskState state;
 

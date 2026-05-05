@@ -43,6 +43,13 @@
 #include "utils.h"
 #include "scheduler.h"
 
+/* ANSI colour codes used in server log output */
+#define GRN "\033[32m"
+#define YEL "\033[33m"
+#define CYN "\033[36m"
+#define RED "\033[31m"
+#define RST "\033[0m"
+
 /* ── thread-safe logging ─────────────────────────────────────────────────── */
 
 /*
@@ -136,7 +143,6 @@ static ssize_t readline_fd(int fd, char *buf, size_t maxlen)
  */
 static void run_builtin_task(TaskNode *t)
 {
-    slog("[TASK #%d] START shell command: \"%s\"\n", t->tid, t->cmdline);
 
     int pfd[2];
     /* pfd[0] = read end, pfd[1] = write end; child writes, parent reads */
@@ -185,18 +191,15 @@ static void run_builtin_task(TaskNode *t)
     /* read in chunks (up to 4096 bytes) until child closes its write end */
     while ((n = read(pfd[0], buf, sizeof(buf))) > 0) {
         if (send_packet(t->sockfd, buf, (size_t)n) < 0) {
-            /* client disconnected before command finished; log and stop sending */
-            slog("[TASK #%d] WARN: client disconnected mid-output\n", t->tid);
+            slog("[%d] WARN: client disconnected mid-output\n", t->tid);
             break;
         }
+        t->bytes_sent += (size_t)n;
     }
-    close(pfd[0]);          /* release pipe read end */
-    waitpid(child, NULL, 0); /* reap zombie; NULL status means we don't care about exit code */
+    close(pfd[0]);
+    waitpid(child, NULL, 0);
 
-    /* zero-length packet is the end-of-command sentinel the client loops on */
     send_packet(t->sockfd, "", 0);
-
-    slog("[TASK #%d] DONE shell command.\n", t->tid);
     t->state = TASK_DONE;
 }
 
@@ -277,17 +280,12 @@ static void run_program_task(TaskNode *t, int quantum)
 
         /* ── parent: save pipe read end, mark task as running ── */
         close(pfd[1]);              /* parent reads from child; doesn't need write end */
-        t->pipe_read_fd = pfd[0];   /* store for subsequent slices */
-        t->launched     = true;     /* prevents a second fork on re-dispatch */
-
-        slog("[TASK #%d] START program \"%s\" (total=%d s, quantum=%d s)\n",
-             t->tid, t->cmdline, t->total_secs, quantum);
+        t->pipe_read_fd = pfd[0];
+        t->launched     = true;
 
     } else {
         /* ── subsequent runs: resume the SIGSTOP'd child ── */
-        kill(t->cpid, SIGCONT);   /* wake the child; it continues from where it stopped */
-        slog("[TASK #%d] RESUME program (remaining=%d s, quantum=%d s)\n",
-             t->tid, t->remaining_secs, quantum);
+        kill(t->cpid, SIGCONT);
     }
 
     /* ── consume up to `quantum` lines from the child's output pipe ── */
@@ -317,19 +315,18 @@ static void run_program_task(TaskNode *t, int quantum)
             break;
         }
 
-        /* forward the line to the client as a framed packet */
         if (send_packet(t->sockfd, linebuf, (size_t)n) < 0) {
-            /* client disconnected mid-execution; kill child to avoid zombies */
-            slog("[TASK #%d] WARN: client disconnected, killing child\n", t->tid);
-            kill(t->cpid, SIGKILL);      /* terminate immediately */
-            waitpid(t->cpid, NULL, 0);   /* reap the zombie */
+            slog("[%d] WARN: client disconnected, killing child\n", t->tid);
+            kill(t->cpid, SIGKILL);
+            waitpid(t->cpid, NULL, 0);
             close(t->pipe_read_fd);
             t->state = TASK_DONE;
             return;
         }
 
-        t->remaining_secs--;  /* one line = one second of CPU consumed */
-        lines_done++;         /* track how many lines ran in this quantum */
+        t->remaining_secs--;
+        lines_done++;
+        t->bytes_sent += (size_t)n;
 
         /*
          * Check preemption again AFTER receiving a line.  A new task could have
@@ -344,24 +341,15 @@ static void run_program_task(TaskNode *t, int quantum)
 
     /* ── decide: task done or just paused ── */
     if (t->remaining_secs <= 0) {
-        /* all lines delivered — reap child and tell the client we are finished */
-        waitpid(t->cpid, NULL, 0);     /* collect exit status; prevents zombie */
-        close(t->pipe_read_fd);        /* release the pipe */
-        send_packet(t->sockfd, "", 0); /* zero-length packet = end-of-command */
-        slog("[TASK #%d] DONE program (ran %d s this slice).\n",
-             t->tid, lines_done);
+        waitpid(t->cpid, NULL, 0);
+        close(t->pipe_read_fd);
+        send_packet(t->sockfd, "", 0);
         t->state = TASK_DONE;
     } else {
-        /*
-         * Quantum expired or preempted — suspend the child.
-         * SIGSTOP is sent here, after the read loop, not inside the loop.
-         * Doing it inside would leave the child in mid-write, which can
-         * corrupt the line currently being assembled in readline_fd.
-         */
         kill(t->cpid, SIGSTOP);
-        t->preempt = 0;   /* clear so the next slice starts with a clean flag */
-        slog("[TASK #%d] PAUSE program (ran %d s, remaining=%d s).\n",
-             t->tid, lines_done, t->remaining_secs);
+        t->preempt = 0;
+        slog("[%d]--- " YEL "waiting" RST " (" YEL "%d" RST ")\n",
+             t->tid, t->remaining_secs);
     }
 }
 
@@ -410,16 +398,11 @@ static void *scheduler_loop(void *arg)
             continue;
         }
 
-        /* claim the CPU and wake the thread that owns the chosen task */
-        cpu_busy          = true;    /* block other dispatches until this task yields */
-        running_task      = chosen;  /* global pointer used by sched_enqueue for preemption */
+        cpu_busy          = true;
+        running_task      = chosen;
         chosen->state     = TASK_ACTIVE;
-        chosen->wake_flag = true;    /* the client thread checks this flag in its cond loop */
-        pthread_cond_signal(&chosen->wake_cond);  /* wake exactly that one client thread */
-
-        slog("[SCHEDULER] Dispatched Task #%d (\"%s\", remaining=%d s)\n",
-             chosen->tid, chosen->cmdline, chosen->remaining_secs);
-        /* loop back: cond_wait at the top will block until client sets cpu_busy=false */
+        chosen->wake_flag = true;
+        pthread_cond_signal(&chosen->wake_cond);
     }
 
     /* unreachable; included for completeness */
@@ -440,17 +423,14 @@ static void *client_handler(void *arg)
     int sockfd = (int)(intptr_t)arg;  /* recover socket fd from void* */
     int tid    = alloc_tid();         /* unique ID for this client */
 
-    slog("[CLIENT #%d] Connected.\n", tid);
+    slog("[%d]<<< client connected\n", tid);
 
     while (1) {
-        /* ── receive one command from the client ── */
         char  *cmd     = NULL;
         size_t cmd_len = 0;
 
-        /* recv_packet allocates *cmd with malloc; we free it at end of command */
         if (recv_packet(sockfd, &cmd, &cmd_len) < 0) {
-            slog("[CLIENT #%d] Connection lost.\n", tid);
-            break;   /* socket error or client closed the connection */
+            break;
         }
 
         /* strip trailing CR / LF that terminals or network framing may add */
@@ -459,13 +439,11 @@ static void *client_handler(void *arg)
             cmd[--len] = '\0';
 
         if (strcmp(cmd, "exit") == 0) {
-            /* client explicitly asked to disconnect — clean exit */
-            slog("[CLIENT #%d] Requested disconnect.\n", tid);
             free(cmd);
             break;
         }
 
-        slog("[CLIENT #%d] Received: \"%s\"\n", tid, cmd);
+        slog("[%d]>>> %s\n", tid, cmd);
 
         /* ── build a TaskNode for this command ── */
         /*
@@ -500,22 +478,21 @@ static void *client_handler(void *arg)
         if (is_prog) {
             t.is_builtin = false;
 
-            /* parse the numeric argument: "./demo N" → N, default to 10 if missing */
             const char *sp  = strchr(cmd, ' ');
             t.total_secs    = (sp && *(sp + 1) != '\0') ? atoi(sp + 1) : 10;
-            if (t.total_secs <= 0) t.total_secs = 10;  /* guard against "demo 0" or bad input */
+            if (t.total_secs <= 0) t.total_secs = 10;
 
-            t.remaining_secs = t.total_secs;   /* full burst at start */
-            t.predicted_secs = t.total_secs;   /* initial SRJF estimate */
-            slog("[CLIENT #%d] Task created as program (burst=%d s).\n",
-                 tid, t.total_secs);
+            t.remaining_secs = t.total_secs;
+            t.predicted_secs = t.total_secs;
         } else {
             t.is_builtin     = true;
-            t.total_secs     = -1;   /* sentinel: -1 means "not applicable" */
-            t.remaining_secs = -1;   /* shell commands have no time budget */
+            t.total_secs     = -1;
+            t.remaining_secs = -1;
             t.predicted_secs = -1;
-            slog("[CLIENT #%d] Task created as shell command.\n", tid);
         }
+
+        slog("[%d]--- " GRN "created" RST " (" GRN "%d" RST ")\n",
+             tid, t.total_secs);
 
         /* ── enqueue and wait for the scheduler to dispatch this task ── */
         pthread_mutex_lock(&sched_mutex);
@@ -532,14 +509,17 @@ static void *client_handler(void *arg)
             while (!t.wake_flag)
                 pthread_cond_wait(&t.wake_cond, &sched_mutex);
 
-            /*
-             * Quantum rule:
-             *   - n_scheduled == 0 means this is the first time we are running
-             *     this task → 3-second quantum (shorter, so new arrivals can preempt sooner).
-             *   - n_scheduled >= 1 → 7-second quantum for all subsequent slices.
-             */
             int quantum = (t.n_scheduled == 0) ? 3 : 7;
-            t.n_scheduled++;  /* increment before running so next slice uses 7 s */
+
+            /* log started on first dispatch, running on all subsequent ones */
+            if (t.n_scheduled == 0)
+                slog("[%d]--- " GRN "started" RST " (" GRN "%d" RST ")\n",
+                     tid, t.total_secs);
+            else
+                slog("[%d]--- " CYN "running" RST " (" CYN "%d" RST ")\n",
+                     tid, t.remaining_secs);
+
+            t.n_scheduled++;
 
             /*
              * Release the global scheduler mutex while executing the task.
@@ -576,25 +556,21 @@ static void *client_handler(void *arg)
          */
         sched_dequeue(&t);
 
-        /* capture queue-empty state while we still hold the lock */
         bool queue_empty = (task_queue == NULL);
         pthread_mutex_unlock(&sched_mutex);
 
-        pthread_cond_destroy(&t.wake_cond);  /* free per-task CV resources */
-        free(cmd);                           /* free recv_packet allocation */
+        slog("[%d]<<< %zu bytes sent\n", tid, t.bytes_sent);
+        slog("[%d]--- " RED "ended" RST " (" RED "%d" RST ")\n",
+             tid, t.remaining_secs);
 
-        /*
-         * Print the Gantt chart only once the entire ready queue empties.
-         * Printing per-task would interleave with other tasks still running.
-         * We check queue_empty here (sampled under the lock) to get a
-         * consistent snapshot without holding the lock during the I/O.
-         */
+        pthread_cond_destroy(&t.wake_cond);
+        free(cmd);
+
         if (queue_empty)
             timeline_print();
     }
 
     close(sockfd);
-    slog("[CLIENT #%d] Disconnected.\n", tid);
     return NULL;
 }
 
@@ -648,7 +624,9 @@ int main(void)
         perror("listen"); close(srv); exit(EXIT_FAILURE);
     }
 
-    slog("[INFO] Server listening on port %d — Phase 4 scheduler active.\n", PORT);
+    slog("--------------------------\n");
+    slog("| Hello, Server Started |\n");
+    slog("--------------------------\n");
 
     /* ── start the dedicated scheduler thread ── */
     pthread_t sched_tid;

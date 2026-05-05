@@ -89,12 +89,12 @@ int main(void)
     if (sock < 0)
         return EXIT_FAILURE;
 
-    printf("[INFO] Connected to server at %s:%d\n", SERVER_IP, PORT);
+    printf("Connected to a server\n");
 
     char line[BUF_SIZE];
 
     while (1) {
-        printf("$ ");
+        printf(">>> ");
         fflush(stdout);
 
         if (fgets(line, BUF_SIZE, stdin) == NULL) {
@@ -121,14 +121,10 @@ int main(void)
         if (strcmp(p, "exit") == 0)
             break;
 
-        /* read and print all response packets until the sentinel */
-        if (receive_command_output(sock) < 0) {
-            printf("[INFO] Server closed the connection.\n");
+        if (receive_command_output(sock) < 0)
             break;
-        }
     }
 
     close(sock);
-    printf("[INFO] Disconnected from server.\n");
     return EXIT_SUCCESS;
 }

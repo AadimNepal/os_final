@@ -239,61 +239,24 @@ void timeline_record(int tid, int duration_secs)
 
 void timeline_print(void)
 {
-    if (!tl_head) return;  /* no program tasks ran; nothing to print */
+    if (!tl_head) return;
 
-    printf("\n=== Scheduling Timeline (Gantt Chart) ===\n");
-
-    /*
-     * Single-line Gantt format:
-     *   0--[P2]--2--[P3]--5--[P2]--11--[P3]--13
-     *
-     * `t` is the cumulative wall-clock time; each slice advances it by
-     * its duration.  We print the start time, the label, and the end time
-     * for every slice in arrival order.
-     */
+    /* print the full scheduling order as one cyan-highlighted line */
+    printf("\033[36m");   /* cyan start */
     int t = 0;
-    printf("  %d", t);
+    printf("(0)");
     for (SliceRecord *sr = tl_head; sr; sr = sr->next) {
-        t += sr->duration;                    /* advance clock by this slice's length */
-        printf("--[P%d]--%d", sr->tid, t);   /* bracket the slice with time markers */
+        t += sr->duration;
+        printf("-P%d-(%d)", sr->tid, t);
     }
-    printf("\n");
+    printf("\033[0m\n");  /* reset colour + newline */
+    fflush(stdout);
 
-    /*
-     * Per-task CPU time summary:
-     * Walk the list once per unique tid.  To avoid printing a tid more than
-     * once, use an O(n²) seen-check: for each `outer` node, scan all previous
-     * nodes to see if we already encountered the same tid.  If yes, skip.
-     * If no, do a second scan to sum all slices belonging to that tid.
-     *
-     * O(n²) is acceptable here because n is bounded by the number of scheduling
-     * slices across the entire session, which is typically small (< 50).
-     */
-    printf("\n  Per-task CPU time:\n");
-    for (SliceRecord *outer = tl_head; outer; outer = outer->next) {
-        /* check whether this tid has already been printed */
-        bool seen = false;
-        for (SliceRecord *prev = tl_head; prev != outer; prev = prev->next) {
-            if (prev->tid == outer->tid) { seen = true; break; }
-        }
-        if (seen) continue;   /* already totalled this task; skip duplicate */
-
-        /* accumulate all slices for this tid */
-        int total = 0;
-        for (SliceRecord *s = tl_head; s; s = s->next) {
-            if (s->tid == outer->tid) total += s->duration;
-        }
-        printf("    P%d: %d s total\n", outer->tid, total);
-    }
-    printf("\n");
-    fflush(stdout);   /* ensure chart appears on the terminal before the next prompt */
-
-    /* free all slice records so subsequent test runs start with a clean list */
     SliceRecord *cur = tl_head;
     while (cur) {
         SliceRecord *nxt = cur->next;
-        free(cur);     /* each record was individually malloc'd in timeline_record */
+        free(cur);
         cur = nxt;
     }
-    tl_head = tl_tail = NULL;   /* reset list pointers to empty state */
+    tl_head = tl_tail = NULL;
 }
